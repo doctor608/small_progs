@@ -1,17 +1,20 @@
+#include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
 
-#define clear() for (int i = 0; i < 100; ++i) puts("");
 #define flush() while (getchar() != '\n');
 #define array_size(arr) sizeof(arr) / sizeof(arr[0])
+
+#define SAVE_FORMAT "%d,%s,%ld,%s\n"
+#define DB_FILE "notes.csv"
 
 #define MAX_NAME 32
 #define MAX_BODY 140
 #define MAX_NOTES 64
-#define END_OF_INPUT '~'
 #define NEW_LINE '~'
 
 typedef struct {
@@ -21,26 +24,22 @@ typedef struct {
 	char body[MAX_BODY];
 } note_t;
 
+volatile int g_is_running = true;
 note_t* g_notes[MAX_NOTES];
-int g_i = 0;
+int g_len = 0;
 
-void print_menu(void) {
-	static const char* menu[] = {
-		"[1] Create a new note.",
-		"[2] List notes.",
-		"[3] Update a note.",
-		"[4] Delete a note.",
-	};
-
-	for (size_t i = 0; i < array_size(menu); ++i) {
-		puts(menu[i]);
-	}
-}
+void load_notes(void);
+void serialize_note(note_t* note);
+void save_note(note_t* note);
+void free_notes(void);
+void create_note(void);
+char* my_fgets(char* s, int n, FILE* stream);
+void list_notes(void);
 
 void list_notes(void) {
 	char buffer[25];
 
-	if (g_i == 0) {
+	if (g_len == 0) {
 		printf("There are no notes\n");
 		return;
 	}
@@ -49,7 +48,7 @@ void list_notes(void) {
 	printf("| %-3s | %-32s | %-23s  |\n", "id", "name", "date");
 	puts("---------------------------------------------------------------------");
 
-	for (int i = 0; i < g_i; ++i) {
+	for (int i = 0; i < g_len; ++i) {
 		strcpy(buffer, ctime(&g_notes[i]->time));
 		buffer[array_size(buffer) - 1] = '\0';
 		printf("| %-3d | %-32s | %-23s |\n", g_notes[i]->id, g_notes[i]->name, buffer);
@@ -67,18 +66,11 @@ char* my_fgets(char* s, int n, FILE* stream) {
 
 void create_note(void)
 {
-	if (g_i == MAX_NOTES) {
-		fprintf(stderr, "Error: max number of notes\n");
-		exit(1);
-	}
-
 	note_t* new_note;
 	if ((new_note = malloc(sizeof(note_t))) == NULL) {
-		fprintf(stderr, "Memory allocation error\n");
+		perror("");
 		exit(1);
 	}
-
-	new_note->id = (g_i == 0) ? 1 : g_notes[g_i - 1]->id + 1;
 
 	printf("Name of note: ");
 	my_fgets(new_note->name, MAX_NAME, stdin);
@@ -86,54 +78,103 @@ void create_note(void)
 	puts("Note body:");
 	char c;
 	int i = 0;
-	while(((c = getchar()) != END_OF_INPUT) && (i <= MAX_BODY)) {
+	while(((c = getchar()) != EOF) && (i <= MAX_BODY)) {
 		new_note->body[i++] = c;
 	}
 
 	new_note->time = time(NULL);
-	g_notes[g_i++] = new_note;
 
+	serialize_note(new_note);
+	save_note(new_note);
+
+	free(new_note);
+}
+
+void save_note(note_t* note) {
 	FILE* out;
-	if (access("notes.csv", F_OK) == -1) {
+	char buffer[256];
+
+	if (access("notes.csv", F_OK) != 0) {
+		note->id = 1;
 		out = fopen("notes.csv", "w");
 		fprintf(out, "id,name,time,body\n");
+		fprintf(out, SAVE_FORMAT, note->id, note->name, note->time, note->body);
+
 	} else {
+		out = fopen("notes.csv", "r");
+		while (fgets(buffer, sizeof(buffer), out));
+		sscanf(buffer, "%d", &note->id);
+		++note->id;
 		out = fopen("notes.csv", "a");
+		fprintf(out, SAVE_FORMAT, note->id, note->name, note->time, note->body);
 	}
 
-	char buffer[MAX_BODY];
-	strcpy(buffer, new_note->body);
-	for (int i = 0; buffer[i] != '\0'; ++i) {
-		if (buffer[i] == '\n') {
-			buffer[i] = NEW_LINE;
-		}
-	}
-	fprintf(out, "%d,%s,%ld,%s\n", new_note->id, new_note->name, new_note->time, buffer);
 	fclose(out);
 }
 
-int main(void)
-{
-	int option;
+// void free_notes(void) {
+// 	for (int i = 0; i < g_len; ++i)
+// 		free(g_notes[i]);
+// }
 
-	print_menu();
-	while ((option = getchar())) {
-		flush();
-		switch (option) {
-		case '1':
-			create_note();
-			break;
-		case '2':
-			list_notes();
-			break;
-		case '3':
-			break;
-		case '4':
-			 break;
-		case 'q':
-			return 0;
+void serialize_note(note_t* note) {
+	for (int i = 0; note->body[i] != '\0'; ++i) {
+		if (note->body[i] == '\n') {
+			note->body[i] = NEW_LINE;
 		}
 	}
+}
 
-	return 0;
+void load_notes(void) {
+	FILE* in;
+	note_t* note;
+	char buffer[256];
+
+	if (access(DB_FILE, F_OK) != 0)
+		return;
+		
+	if ((in = fopen(DB_FILE, "r")) == NULL) {
+		perror("");
+		exit(1);
+	}
+
+	fgets(buffer, sizeof(buffer), in);
+	while (fgets(buffer, sizeof(buffer), in) != NULL) {
+		if ((note = malloc(sizeof(note_t))) == NULL) {
+			perror("");
+			exit(1);
+		}
+
+		sscanf(buffer, SAVE_FORMAT, &note->id, note->name, &note->time, note->body);
+	}
+
+	fclose(in);
+}
+
+int main(int argc, char* argv[])
+{
+	const char* command;
+
+	if (argc < 2) {
+		fprintf(stderr, "Usage: note <[create|list|read|delete]>\n");
+		return EXIT_FAILURE;
+	}
+
+	// load_notes();
+	command = argv[1];
+
+	if (strcmp(command, "create") == 0) {
+		create_note();
+	} else if (strcmp(command, "list") == 0) {
+		list_notes();
+	} else if (strcmp(command, "read") == 0) {
+		puts("read");
+	} else if (strcmp(command, "delete") == 0) {
+		puts("delete");
+	} else {
+		fprintf(stderr, "Unkown command\n");
+		return EXIT_FAILURE;
+	}
+
+	return EXIT_SUCCESS;
 }
